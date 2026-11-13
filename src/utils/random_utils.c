@@ -37,7 +37,7 @@
 
 
 /* FIXME - move this all over into a compatibility/platform check header */
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__ANDROID__)
 #    include <stdlib.h>
 
 uint64_t random_u64(uint64_t upper_bound) {
