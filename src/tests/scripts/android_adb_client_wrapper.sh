@@ -33,10 +33,22 @@ for a in "$@"; do
   quoted+=("$(printf '%q' "$a")")
 done
 
+# Only tunnel ports that have a listener on the host. An adb reverse tunnel with nothing behind
+# it still accepts the device-side TCP connect and then drops it, which looks like a successful
+# connect to protocols with no handshake (Modbus) instead of "connection refused".
+# `ss -ltn` checks without connecting, so it doesn't disturb servers whose logs tests inspect.
+host_listening() {
+  ss -Hltn "sport = :$1" 2>/dev/null | grep -q .
+}
+
 if [[ $server_on_device -eq 0 ]]; then
   ports="$(printf '%s\n' "$@" | grep -oE '127\.0\.0\.1:[0-9]+' | cut -d: -f2 | sort -u)"
   for p in $ports $DEFAULT_LIB_PORT; do
-    "$ADB" reverse "tcp:$p" "tcp:$p" >/dev/null
+    if host_listening "$p"; then
+      "$ADB" reverse "tcp:$p" "tcp:$p" >/dev/null
+    else
+      "$ADB" reverse --remove "tcp:$p" >/dev/null 2>&1 || true
+    fi
   done
 fi
 
