@@ -1625,6 +1625,174 @@ jobs:
           echo "PR Title: $PR_TITLE"
           echo "PR Body: $PR_BODY"
 
+  android_ndk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            page_16k: true
+          - abi: x86_64
+            page_16k: true
+          - abi: armeabi-v7a
+            page_16k: false
+          - abi: x86
+            page_16k: false
+
+    env:
+      ARTIFACT: ""
+      BUILD: "${{ github.workspace }}/build"
+      DIST: "${{ github.workspace }}/build/bin_dist"
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+      # NDK r28+ produces 16 KB page-aligned libraries, which Google Play requires for 64-bit ABIs.
+      NDK_VERSION: r28c
+      ANDROID_PLATFORM: android-24
+
+    steps:
+      - name: Print out current branch and ABI
+        run: echo "Building branch ${{ env.BRANCH }} for Android ${{ matrix.abi }}"
+
+      - name: "Checkout library source."
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || env.BRANCH }}
+
+      - name: Extract version from CMakeLists.txt
+        run: |
+          MAJOR=$(grep -E "set \(libplctag_VERSION_MAJOR" CMakeLists.txt | sed -E 's/.*[^0-9]([0-9]+).*/\1/')
+          MINOR=$(grep -E "set \(libplctag_VERSION_MINOR" CMakeLists.txt | sed -E 's/.*[^0-9]([0-9]+).*/\1/')
+          PATCH=$(grep -E "set \(libplctag_VERSION_PATCH" CMakeLists.txt | sed -E 's/.*[^0-9]([0-9]+).*/\1/')
+          VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "ARTIFACT=libplctag_${VERSION}_android_${{ matrix.abi }}" >> $GITHUB_ENV
+          echo "Detected version: ${VERSION}"
+
+      - name: Install Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      - name: Configure CMake with the NDK toolchain
+        run: |
+          rm -rf ${{ env.BUILD }}
+          cmake -S . -B ${{ env.BUILD }} \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=${{ env.ANDROID_PLATFORM }}
+
+      - name: Build
+        run: cmake --build ${{ env.BUILD }} --parallel
+
+      - name: Strip library and check page alignment
+        run: |
+          LLVM=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+          $LLVM/llvm-strip --strip-unneeded ${{ env.DIST }}/libplctag.so
+          $LLVM/llvm-readelf -lW ${{ env.DIST }}/libplctag.so | grep LOAD
+          if [ "${{ matrix.page_16k }}" = "true" ]; then
+            $LLVM/llvm-readelf -lW ${{ env.DIST }}/libplctag.so | awk '/LOAD/ && $NF != "0x4000" { bad=1 } END { exit bad }' \
+              || { echo "::error::libplctag.so is not 16 KB page aligned"; exit 1; }
+          fi
+
+      - name: Create ZIP artifacts
+        run: |
+          cd ${{ env.DIST }}
+          # Create dev ZIP with only library files
+          zip -r "../${{ env.ARTIFACT }}_dev.zip" libplctag.*
+
+          # Create full ZIP with all binaries
+          zip -r "../${{ env.ARTIFACT }}.zip" .
+
+          cd ..
+          mkdir -p release_zips
+          mv *.zip release_zips/
+
+      - name: Upload ZIP artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT }}_zips
+          path: ${{ env.BUILD }}/release_zips/*.zip
+          if-no-files-found: error
+
+      # The full build output (library, test clients, servers) for the emulator test job.
+      - name: Upload binaries for emulator tests
+        if: matrix.abi == 'x86_64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-bin-x86_64
+          path: ${{ env.DIST }}/
+          retention-days: 3
+
+  android_emulator:
+    needs: android_ndk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Lowest supported API level and current. On API 24 the Modbus scheduling fairness
+          # stress test is unreliable on the emulator, so the stress group runs on API 35 only.
+          - api_level: 24
+            runner_args: --skip-groups stress
+          - api_level: 35
+            runner_args: ""
+
+    env:
+      BUILD: "${{ github.workspace }}/build"
+      DIST: "${{ github.workspace }}/build/bin_dist"
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+
+    steps:
+      - name: "Checkout library source."
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || env.BRANCH }}
+
+      # Servers run on the runner. The test runner also looks up client executables here,
+      # but the wrapper runs the Android builds of them.
+      - name: Build host servers
+        run: |
+          cmake -S . -B ${{ env.BUILD }} -DCMAKE_BUILD_TYPE=MinSizeRel
+          cmake --build ${{ env.BUILD }} --parallel
+
+      - name: Download Android binaries
+        uses: actions/download-artifact@v5
+        with:
+          name: android-bin-x86_64
+          path: android-bin
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Simulator Tests on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api_level }}
+          arch: x86_64
+          target: default
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: bash src/tests/scripts/run_android_simulator_tests.sh android-bin ${{ env.DIST }} logs --timeout-scale 3 ${{ matrix.runner_args }}
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-logs-android_api${{ matrix.api_level }}
+          path: |
+            logs/*.log
+          retention-days: 7
+
   create_release:
     needs:
       [
@@ -1637,6 +1805,8 @@ jobs:
         ubuntu_thread_sanitizer,
         macos_mem_sanitizer,
         macos_thread_sanitizer,
+        android_ndk,
+        android_emulator,
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
