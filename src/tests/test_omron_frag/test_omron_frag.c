@@ -130,9 +130,9 @@
 #else
 #    define SERVER_START \
         "%s --plc=Omron --port=%d --tag=TestDINTArray:DINT[10] --tag=TestBigArray:DINT[2000] %s > " \
-        "/tmp/omron_frag_test_server_%d.log 2>&1 & echo $! > " \
-        "/tmp/ab_server_frag_%d.pid"
-#    define SERVER_STOP "kill -TERM $(cat /tmp/ab_server_frag_%d.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/ab_server_frag_%d.pid"
+        "${TMPDIR:-/tmp}/omron_frag_test_server_%d.log 2>&1 & echo $! > " \
+        "${TMPDIR:-/tmp}/ab_server_frag_%d.pid"
+#    define SERVER_STOP "kill -TERM $(cat ${TMPDIR:-/tmp}/ab_server_frag_%d.pid 2>/dev/null) 2>/dev/null; rm -f ${TMPDIR:-/tmp}/ab_server_frag_%d.pid"
 #endif
 
 #define log(...)                         \
